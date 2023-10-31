@@ -4,6 +4,28 @@ import torch
 import ctypes
 from typing import Union, List, Optional
 import pandas as pd
+import numpy as np
+
+
+def project_matrix_onto_subspace(A, M):
+    P = A @ M.T @ M
+    return P
+
+def effective_attention(A, V):
+    r""" Inspired by paper: Effective Attention Sheds Light On Interpretability
+    
+    """
+    U, S, _ = torch.linalg.svd(V, full_matrices=True) # need full SVD for left null space
+    # rows of U that correspond to zero singular values (u_1, ..., u_k) 
+    #   are bases of the left null space of V
+    cols = torch.arange(S.shape[0], U.shape[0])
+    LN_V = U[:, cols].T # LN_V has the rows of U.T that correspond to zero singular values. LN_V is the left null space of V
+    # projection of (rows of) A onto the left null space of V.
+    #   projection of a matrix A onto a subspace spanned by orthonormal set {u_1, u_2, ..., u_k}
+    #   This projection matrix P is the null component of A (PV = 0)
+    P = project_matrix_onto_subspace(A, LN_V)
+    # assert torch.allclose(P@V, torch.zeros_like(V), atol=1e-7, rtol=1e-7)
+    return A - P
 
 def tensor2numpy(tensor):
     if tensor.is_cuda:
@@ -25,3 +47,11 @@ def convert2tensor(
         x = torch.tensor(x, dtype=dtype)
     return x
 
+def check_grad_backprop(model):
+    for name, parms in model.named_parameters():
+        print(
+            '-->name:', name, 
+            '-->grad_requirs:', parms.requires_grad, 
+            '--weight', torch.mean(parms.data), 
+            ' -->grad_value:', torch.mean(parms.grad)
+        )
