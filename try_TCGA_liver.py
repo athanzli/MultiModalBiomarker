@@ -13,10 +13,12 @@ import scipy
 import sklearn
 from sklearn import linear_model
 import shap
+import torch.functional as F
+import lifelines
 
 #
 import utils
-from model import MMBL, MLP
+from model import MMBL
 
 def set_random_seed(seed: int):
     random.seed(seed)
@@ -30,9 +32,13 @@ set_random_seed(42)
 
 
 def att_cat(A, cat_mask):
+    r""" Get the average or median attention scores matrix for a particular category.
+    
+    """
     A_avg = np.median(A[cat_mask], axis=0)
     feature_attn = np.mean(A_avg, axis=0)
     return A_avg, feature_attn
+
 def plot_ft_imp(ft_names, ft_imp, n_top=10, title=None):
     sorted_idx = sorted(range(len(ft_imp)), key=lambda k: ft_imp[k], reverse=True)
     sorted_ft = [ft_names[i] for i in sorted_idx]
@@ -59,22 +65,147 @@ def two_sets_stats(set1, set2):
     print("Only in set2:", len(only_set2), '. ', only_set2)
     return intersection, only_set1, only_set2
 
-#%% ################################# data
-#%% ################################# data: mRNA
-# mrna
+def remove_dashdash(df):
+    # TODO just a temp func
+    idx=[]
+    for i in range(df.shape[1]):
+        if (df.iloc[:, i].values=="'--").sum() == df.shape[0]:
+            idx.append(i)
+    df = df.drop(columns=df.columns[idx])
+    return df
+
+
+#%% ################################# data: mRNA raw data
 mrna = pd.read_csv('./data/TCGA-LIHC_from_GDC_raw/TCGA_LIHC_mRNA_raw_counts.csv', index_col=0)
+# for DEG
 tumor_type_codes = [int(barcode.split('-')[3][:-1]) for barcode in mrna.columns.values] # https://docs.gdc.cancer.gov/Encyclopedia/pages/images/TCGA-TCGAbarcode-080518-1750-4378.pdf
-y = pd.Series(tumor_type_codes).map({1: 'tumor', 2: 'tumor', 11:'normal'}).values # 1 for solid tumor, 0 for normal
-print(np.unique(y, return_counts=True))
-pd.DataFrame(index=mrna.columns.values, columns=['sample_type'], data=y).to_csv('./data/TCGA-LIHC_from_GDC_raw/TCGA_LIHC_mRNA_raw_counts_sample_type.csv')
+sampletype_label = pd.DataFrame(
+    index=mrna.columns.values, 
+    columns=['sample_type'], 
+    data=pd.Series(tumor_type_codes).map({1: 'tumor', 2: 'tumor', 11:'normal'}).values
+ )
+sampletype_label.to_csv('./data/TCGA-LIHC_from_GDC_raw/TCGA_LIHC_mRNA_raw_counts_sample_type.csv')
+deg = pd.read_csv('./data/TCGA-LIHC_from_GDC_raw/DEG_trn.csv', index_col=0)
+deg_set = deg[(deg['padj']<0.05) & (deg['log2FoldChange'].abs()>2)].index # TODO
+
 X = mrna.T
 # # remove features that have 0 values across more than 20% samples
 # X = X.iloc[:, ~((X == 0).sum(axis=0)>X.shape[0]*0.2).values]
 # log normalization
-X_raw = X
 X = np.log(X+1)
+X = X.loc[:, deg_set]
 
-#%% split
+#%% ################################# data: save some labels
+clinic0 = pd.read_table('./data/TCGA-LIHC_from_GDC_raw/clinical.cart.2023-10-30/clinical.tsv', index_col=0)
+clinic0 = remove_dashdash(clinic0)
+clinic = clinic0[['case_submitter_id', 'project_id', 'age_at_index', 'days_to_death', 'ajcc_pathologic_stage',
+            'vital_status', 'days_to_last_follow_up', 'treatment_or_therapy', 'treatment_type']] # only these columns are useful # the reason there are duplicated samples is that each sample has two rows for treatment info
+#%% treatment label
+treatment_label = pd.DataFrame(index=clinic['case_submitter_id'].unique(), columns=['treatment'])
+for pt in clinic['case_submitter_id'].unique():
+    tmp = clinic[clinic['case_submitter_id']==pt][['treatment_or_therapy', 'treatment_type']]
+    # 4 cases
+    # Pharmaceutical Therapy, NOS |  Radiation Therapy, NOS | treatment
+    # No                          |  No                     |  
+    # No                          |  Yes                    | 
+    # Yes                         |  No                     | 
+    # Yes                         |  Yes                    | 
+    # not reported                |  not reported           | nan
+    if (tmp[tmp['treatment_type']=='Pharmaceutical Therapy, NOS']['treatment_or_therapy'].values[0] == 'no') \
+        & (tmp[tmp['treatment_type']=='Radiation Therapy, NOS']['treatment_or_therapy'].values[0] == 'no'):
+        treatment_label.loc[pt, 'treatment'] = 'no treatment'
+    if (tmp[tmp['treatment_type']=='Pharmaceutical Therapy, NOS']['treatment_or_therapy'].values[0] == 'no') \
+        & (tmp[tmp['treatment_type']=='Radiation Therapy, NOS']['treatment_or_therapy'].values[0] == 'yes'):
+        treatment_label.loc[pt, 'treatment'] = 'radi'
+    if (tmp[tmp['treatment_type']=='Pharmaceutical Therapy, NOS']['treatment_or_therapy'].values[0] == 'yes') \
+        & (tmp[tmp['treatment_type']=='Radiation Therapy, NOS']['treatment_or_therapy'].values[0] == 'no'):
+        treatment_label.loc[pt, 'treatment'] = 'pharma'
+    if (tmp[tmp['treatment_type']=='Pharmaceutical Therapy, NOS']['treatment_or_therapy'].values[0] == 'yes') \
+        & (tmp[tmp['treatment_type']=='Radiation Therapy, NOS']['treatment_or_therapy'].values[0] == 'yes'):
+        treatment_label.loc[pt, 'treatment'] = 'pharma + radi'
+    if (tmp[tmp['treatment_type']=='Pharmaceutical Therapy, NOS']['treatment_or_therapy'].values[0] == 'not reported') \
+        & (tmp[tmp['treatment_type']=='Radiation Therapy, NOS']['treatment_or_therapy'].values[0] == 'not reported'):
+        treatment_label.loc[pt, 'treatment'] = np.nan
+
+#%% stage label
+tmp = clinic[['case_submitter_id', 'ajcc_pathologic_stage']].drop_duplicates()
+stage_label = pd.DataFrame(
+    index=tmp['case_submitter_id'].values, 
+    columns=['pathological_stages'], 
+    data=tmp['ajcc_pathologic_stage'].values)
+stage_label.loc[(stage_label=="'--").values.flatten(), 'pathological_stages'] = np.nan 
+#%% ################################# data: survival
+# use days_to_death, days_to_last_follow_up, vital status
+# T:
+#   for dead patients, T = days_to_death
+#   for alive patients, T = days_to_last_follow_up
+#   if not reported, then T is NA
+# Censor: 
+#   if alive, then Censor is labeled as 0
+#   if dead, then Censor is labeled as 1
+#   if not reported, then Censor is NA
+
+surv = clinic.drop(columns=['treatment_or_therapy', 'treatment_type'])
+surv = surv.drop_duplicates()
+surv.index = surv['case_submitter_id'].values
+surv = surv.drop(columns=['case_submitter_id'])
+surv.loc[surv['vital_status']=='Dead', 'T'] = surv.loc[surv['vital_status']=='Dead', 'days_to_death']
+surv.loc[surv['vital_status']=='Alive', 'T'] = surv.loc[surv['vital_status']=='Alive', 'days_to_last_follow_up']
+surv = surv.dropna(subset=['T'])
+surv = surv[~(surv['T']=="'--")]
+surv['T'] = surv['T'].astype(float)
+surv['E'] = surv['vital_status'].map({'Dead': 1, 'Alive': 0})
+
+# TODO CHOOSE
+# surv['group'] = treatment_label.loc[surv.index] # TODO choose label group
+# surv['group'] = surv['group'].map({'no treatment': 'no treatment', 'radi': 'treatment', 'pharma': 'treatment', 'pharma + radi': 'treatment'})
+
+surv['group'] = stage_label.loc[surv.index] # TODO choose label group
+surv['group'] = surv['group'].map({
+    'Stage I': 'Stage I',
+    'Stage II': 'Stage II',
+    'Stage III': 'Stage III',
+    'Stage IIIA': 'Stage III',
+    'Stage IIIB': 'Stage III',
+    'Stage IIIC': 'Stage III',
+    'Stage IVA': 'Stage IV',
+    'Stage IVB': 'Stage IV',
+    'Stage IV': 'Stage IV',
+})
+print(surv['group'].value_counts())
+
+#%%
+df = surv
+ax = plt.subplot(111)
+kmf = lifelines.fitters.kaplan_meier_fitter.KaplanMeierFitter()
+for name, grouped_df in df.groupby('group'):
+    kmf.fit(grouped_df["T"], grouped_df["E"], label=name)
+    kmf.plot_survival_function(ax=ax)
+mask = (df['group'] == 'Stage II') | ((df['group'] == 'Stage III')) # TODO choose
+p = lifelines.statistics.pairwise_logrank_test(
+    df['T'][mask], df['group'][mask], df['E'][mask]).summary['p']
+ax.text(0.3, 0.85, f'log-rank test p = {p.values[0]:.2e}', transform=ax.transAxes)
+
+#%% #
+# from lifelines import CoxPHFitter
+# from lifelines.datasets import load_regression_dataset
+# regression_dataset = load_regression_dataset() # a Pandas DataFrame
+# cph = CoxPHFitter()
+# cph.fit(regression_dataset, 'T', event_col='E')
+# cph.print_summary()
+
+# pt = regression_dataset.loc[0]
+# cph.predict_survival_function(pt).rename(columns={0:'CoxPHFitter'}).plot()
+
+#%% ################################# some initial survival analysis
+
+#%% ################################# prepare X and y
+pts = np.unique(['-'.join(pt.split('-')[:3]) for pt in X.index])
+# choose only tumor samples
+X = X.loc[pd.Series(tumor_type_codes).map({1: True, 2: False, 11:False}).values, :] # NOTE here map 2 to false, because clinic's patients are all with label 1
+y = stage
+
+#%% ########################### split and prep data
 sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=0)
 train_idx, test_idx = next(sss.split(X, y))
 X_trn, X_tst = X.iloc[train_idx], X.iloc[test_idx]
@@ -83,17 +214,13 @@ print(np.unique(y_trn, return_counts=True))
 X_trn.T.to_csv("./data/TCGA-LIHC_from_GDC_raw/TCGA_LIHC_mRNA_raw_counts_trn.csv")
 pd.DataFrame(index=X_trn.index.values, columns=['sample_type'], data=y_trn).to_csv('./data/TCGA-LIHC_from_GDC_raw/TCGA_LIHC_mRNA_raw_counts_sample_type_trn.csv')
 
-#%% deg set
-deg = pd.read_csv('./data/TCGA-LIHC_from_GDC_raw/DEG_trn.csv', index_col=0)
-deg_set = deg[(deg['padj']<0.05) & (deg['log2FoldChange'].abs()>4)].index # TODO
-X_trn = X_trn[deg_set]
-X_tst = X_tst[deg_set]
+X_trn = X_trn
+X_tst = X_tst
 assert all((X_trn.columns==X_tst.columns) & (X_trn.columns==deg_set))
 y_trn = pd.Series(y_trn).map({'tumor': 1, 'normal': 0}).values
 y_tst = pd.Series(y_tst).map({'tumor': 1, 'normal': 0}).values
 ft_names = X_trn.columns.values
-
-#%% scaling
+# scaling
 scaler = StandardScaler()
 X_trn = scaler.fit_transform(X_trn)
 X_tst = scaler.transform(X_tst)
@@ -106,15 +233,7 @@ X_tst = scaler.transform(X_tst)
 # (~tumor_type_info['Blood Derived Normal'].isna()).sum()
 # (~tumor_type_info['Solid Tissue Normal'].isna()).sum()
 
-#%% ################################# data: clinical
-r"""
-- the reason why there are overlapping rows (patients) is that some patients have multiple rows recording differnt level of information (e.g., treamtent)
-"""
-clinic = pd.read_table('./data/TCGA-LIHC_from_GDC_raw/clinical.cart.2023-10-30/clinical.tsv', index_col=0)
-clinic = clinic[['case_submitter_id', 'project_id', 'age_at_index', 'days_to_death', 'days_to_last_follow_up', 'vital_status', 'treatment_or_therapy', 'treatment_type']]
-# mrna_samples = ['-'.join(sample_id.split('-')[:3]) for sample_id in mrna.index]
-
-# The data from UCSC
+# TODO DEL The data from UCSC
 # clinic = pd.read_table("C:/Users/athan/OneDrive/Desktop/MMBiomarker/MMBiomarker/data/TCGA-LIHC_from_UCSC/TCGA.LIHC.sampleMap_LIHC_clinicalMatrix")
 # tumor_type_info = clinic.groupby(['_PATIENT', 'sample_type']).size().unstack()
 # (~tumor_type_info['Primary Tumor'].isna()).sum()
@@ -122,86 +241,12 @@ clinic = clinic[['case_submitter_id', 'project_id', 'age_at_index', 'days_to_dea
 # (~tumor_type_info['Recurrent Tumor'].isna()).sum()
 # mrna = pd.read_talbe('C:\Users\athan\OneDrive\Desktop\MMBiomarker\MMBiomarker\data\TCGA-LIHC_from_UCSC\HiSeqV2')
 
-#%% ################################# data: survival
-# TODO use days_to_death, days_to_last_follow_up, vital status
-# OS:
-#   for dead patients, OS = days_to_death
-#   for alive patients, OS = days_to_last_follow_up
-#   if not reported, then OS is NA
-# Censor: 
-#   if alive, then Censor is labeled as 0
-#   if dead, then Censor is labeled as 1
-#   if not reported, then Censor is NA
 
-# see stats and plot KM
-pts_in_X = ['-'.join(pt.split('-')[:3]) for pt in X.index]
-group_info = pd.DataFrame(index=pts_in_X, columns=['sample_type'], data=y)
-surv = pd.read_table("./data/TCGA-LIHC_from_UCSC/survival_LIHC_survival.txt", index_col=0) # NOTE from UCSC
-sample_type = pd.Series([int(pt.split('-')[-1]) for pt in surv.index], index=surv.index)
-# pts = ['-'.join(pt.split('-')[:3]) for pt in surv.index]
-# _, __, only_pts = two_sets_stats(pts_in_X, pts)
-# surv = surv.drop(index=surv.index[np.where(surv['_PATIENT'].isin(only_pts))[0]])
-surv['group'] = sample_type.map({1: 'tumor', 2: 'tumor', 11:'normal'})
-surv = surv.drop(index=['TCGA-2V-A95S-01']) # remove nan
 
-# prepare
-X.index
 
-import lifelines
-r"""
-from lifelines.datasets import load_waltons
-df = load_waltons() # returns a Pandas DataFrame
-print(df.head())
-
-T = df['T']
-E = df['E']
-
-    T  E    group
-0   6  1  miR-137
-1  13  1  miR-137
-2  13  1  miR-137
-3  13  1  miR-137
-4  19  1  miR-137
-"""
-df = surv
-T = df['OS.time']
-E = df['OS']
-df['T'] = df['OS.time']
-df['E'] = df['OS']
-
-from lifelines import KaplanMeierFitter
-kmf = KaplanMeierFitter()
-kmf.fit(T, event_observed=E) # timeline=range(0, 100, 2))
-kmf.survival_function_
-kmf.plot_survival_function()
-
-#
-ax = plt.subplot(111)
-kmf = KaplanMeierFitter()
-for name, grouped_df in df.groupby('group'):
-    kmf.fit(grouped_df["T"], grouped_df["E"], label=name)
-    kmf.plot_survival_function(ax=ax)
-# from lifelines.statistics import logrank_test
-# results = logrank_test(T1, T2, event_observed_A=E1, event_observed_B=E2)
-# results.print_summary()
-# print(results.p_value)        # 0.7676
-# print(results.test_statistic) # 0.0872
-from lifelines.statistics import pairwise_logrank_test
-p = pairwise_logrank_test(df['T'], df['group'], df['E']).summary['p']
-ax.text(0.5, 0.5, f'log-rank test p = {p.values[0]:.3e}', transform=ax.transAxes)
-
-#
-from lifelines import CoxPHFitter
-from lifelines.datasets import load_regression_dataset
-regression_dataset = load_regression_dataset() # a Pandas DataFrame
-cph = CoxPHFitter()
-cph.fit(regression_dataset, 'T', event_col='E')
-cph.print_summary()
-
-pt = regression_dataset.loc[0]
-cph.predict_survival_function(pt).rename(columns={0:'CoxPHFitter'}).plot()
-
-#%% ################################ model
+#%% ###########################################################################
+# ################################# model #####################################
+# #############################################################################
 model = MMBL(
     seq_len = X_trn.shape[1],
     emb_dim = 32,
@@ -233,7 +278,8 @@ trn_loader = torch.utils.data.DataLoader(
 
 #%% ############################### training for binary/multi-class classification
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
-loss_fn = torch.nn.BCEWithLogitsLoss()
+# loss_fn = torch.nn.BCEWithLogitsLoss()
+loss_fn = torch.nn.CrossEntropyLoss()
 
 n_epochs = 30
 for epoch in range(n_epochs):
@@ -282,6 +328,10 @@ for epoch in range(n_epochs):
 
 
 #%% ############################### training for hazard function regression (survival)
+def hazard_loss(
+
+)
+
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
 loss_fn = torch.nn.BCEWithLogitsLoss()
 
@@ -331,6 +381,7 @@ for epoch in range(n_epochs):
     tst_acc.append(acc.item())
 
 
+
 #%% plot
 _, axes = plt.subplots(1, 2, figsize=(10, 5))
 axes[0].plot(trn_losses, label='train')
@@ -372,8 +423,3 @@ sns.heatmap(A_avg, cmap='Reds', ); plt.show()
 
 
 #%% #################################### backup code
-idx=[]
-for i in range(clinic.shape[1]):
-    if (clinic.iloc[:, i].values[3]=="'--") & (clinic.iloc[:, i].values[35]=="'--") & (clinic.iloc[:, i].values[66]=="'--") & (clinic.iloc[:, i].values[111]=="'--"):
-        idx.append(i)
-clinic = clinic.drop(columns=clinic.columns[idx])
