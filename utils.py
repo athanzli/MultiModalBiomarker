@@ -2,10 +2,13 @@
 import numpy as np
 import torch
 import ctypes
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Tuple
 import pandas as pd
 import numpy as np
-
+import random
+import os
+import captum
+import matplotlib.pyplot as plt
 
 def project_matrix_onto_subspace(A, M):
     P = A @ M.T @ M
@@ -14,6 +17,9 @@ def project_matrix_onto_subspace(A, M):
 def effective_attention(A, V):
     r""" Inspired by paper: Effective Attention Sheds Light On Interpretability
     
+    Shape:
+        - A: (n_tokens, n_tokens_cond)
+        - V: (n_tokens, d_v)
     """
     U, S, _ = torch.linalg.svd(V, full_matrices=True) # need full SVD for left null space
     # rows of U that correspond to zero singular values (u_1, ..., u_k) 
@@ -55,3 +61,24 @@ def check_grad_backprop(model):
             '--weight', torch.mean(parms.data), 
             ' -->grad_value:', torch.mean(parms.grad)
         )
+
+
+
+
+
+###############################################################################
+###############################################################################
+###############################################################################
+
+def set_random_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+
+
+
