@@ -461,19 +461,6 @@ class MMBL(torch.nn.Module):
 
         # TEMP NOTE  to(device) will move all sub nn.Modules and nn.Parameters to device, but will not move tensors created in those modules' forward to device
 
-        """ NOTE temp from GPT
-            The self.to(device) call in the __init__ method of your MMBL class moves all parameters and buffers of the MMBL instance to the specified device. This includes parameters and buffers of any submodules (instances of other nn.Module classes) that are attributes of MMBL at the time self.to(device) is called.
-
-            However, there are a few nuances to consider:
-
-            Submodules at Instantiation: For submodules that are instantiated and assigned as attributes of MMBL before the self.to(device) call (like self.module1, self.last_linear_layer, and self.module3 in your code), these submodules and all their parameters and buffers will be moved to the specified device.
-
-            Submodule's Internal Tensors: If a submodule creates tensors internally (e.g., in its forward method), these tensors are not automatically moved to the device. Each submodule is responsible for ensuring that any tensors it creates during execution are on the correct device. This often means using .to(self.device) within the submodule's methods.
-
-            Dynamic Submodule Addition: If you add submodules to MMBL after the self.to(device) call, those newly added submodules will not automatically be on the specified device. You would need to call self.to(device) again or ensure the new submodules are added to the correct device.
-
-            Pretrained weight Handling: If you're loading pretrained weight (like pretrained_token_emb_weight in your code) and assigning them to a submodule after self.to(device) has been called on the parent module, you must ensure these weight are on the correct device before assigning them.
-        """
 
     def forward(
         self, 
